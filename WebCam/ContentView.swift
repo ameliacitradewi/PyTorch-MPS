@@ -6,10 +6,18 @@
 //
 
 import SwiftUI
+import Combine
 
 struct ContentView: View {
 #if os(iOS) || os(macOS)
     @StateObject private var detector = CameraDetectorViewModel()
+    @State private var currentDate = Date()
+    private let clockTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd-MM-yyyy HH:mm:ss"
+        return formatter
+    }()
 #endif
 
     var body: some View {
@@ -17,6 +25,17 @@ struct ContentView: View {
         ZStack {
             CameraPreview(session: detector.session)
                 .ignoresSafeArea()
+
+            if !detector.isPaused, let screenshotImage = detector.screenshotOverlayImage {
+                GeometryReader { geometry in
+                    Image(decorative: screenshotImage, scale: 1.0)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                }
+                .ignoresSafeArea()
+            }
 
             if detector.isPaused, let pausedImage = detector.pausedPreviewImage {
                 GeometryReader { geometry in
@@ -42,60 +61,74 @@ struct ContentView: View {
 
                     Text(detector.statusMessage)
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(0.9))
+                        .foregroundStyle(.white.opacity(1))
                         .lineLimit(2)
 
                     Text(detector.computeDebugLine)
                         .font(.caption2)
-                        .foregroundStyle(.cyan.opacity(0.95))
+                        .foregroundStyle(.cyan.opacity(1))
                         .monospaced()
 
                     Text(detector.requestedComputeDebugLine)
                         .font(.caption2)
-                        .foregroundStyle(.cyan.opacity(0.95))
+                        .foregroundStyle(.cyan.opacity(1))
                         .monospaced()
 
                     Text(detector.torchDebugLine)
                         .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.85))
+                        .foregroundStyle(.white.opacity(1))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
 
                     Text(detector.pythonDebugLine)
                         .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.85))
+                        .foregroundStyle(.white.opacity(1))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
 
-                    Text("Persons: \(detector.isPaused ? "—" : "\(detector.personCount)")")
-                        .font(.title3)
-                        .fontWeight(.bold)
-                        .foregroundStyle(detector.personCount > 0 && !detector.isPaused ? .red : .gray)
-
-                    Text("FPS: \(String(format: "%.1f", detector.fps))")
-                        .font(.title3)
-                        .foregroundStyle(.gray)
-                        .monospacedDigit()
-
-                    Text("Time: \(String(format: "%.1f", detector.elapsedSeconds))s")
-                        .font(.title3)
-                        .foregroundStyle(.gray)
-                        .monospacedDigit()
                 }
 
                 Spacer()
 
                 HStack(alignment: .bottom) {
-                    if detector.showScreenshotSavedBanner {
-                        Text("SCREENSHOT SAVED!")
-                            .font(.title3)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Persons: \(detector.isPaused ? "—" : "\(detector.personCount)")")
+                            .font(.largeTitle)
                             .fontWeight(.bold)
-                            .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.4))
+                            .foregroundStyle(detector.personCount > 0 && !detector.isPaused ? .red : .black)
+
+                        Text("FPS: \(String(format: "%.1f", detector.fps))")
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .monospacedDigit()
+
+                        Text("Date: \(Self.dateFormatter.string(from: currentDate))")
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .monospacedDigit()
+
+                        Text("Time elapsing: \(String(format: "%.1f", detector.elapsedSeconds))s")
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .monospacedDigit()
+
+                        if detector.showScreenshotSavedBanner {
+                            Text("SCREENSHOT SAVED!")
+                                .font(.title3)
+                                .fontWeight(.bold)
+                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.4))
+                        }
                     }
 
                     Spacer()
 
                     VStack(alignment: .leading, spacing: 2) {
+                        if detector.isPaused {
+                            Text("PAUSED")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(.red)
+                                .padding(.bottom, 4)
+                        }
                         Text("Press [q]=Quit")
                         Text("[s]=Screenshot")
                         Text("[p]=Pause/Resume")
@@ -107,12 +140,6 @@ struct ContentView: View {
             }
             .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-            if detector.isPaused {
-                Text("PAUSED")
-                    .font(.system(size: 56, weight: .bold))
-                    .foregroundStyle(.red)
-            }
         }
         .background(.black)
         .onAppear {
@@ -120,6 +147,9 @@ struct ContentView: View {
         }
         .onDisappear {
             detector.stop()
+        }
+        .onReceive(clockTimer) { value in
+            currentDate = value
         }
 #else
         VStack(spacing: 10) {

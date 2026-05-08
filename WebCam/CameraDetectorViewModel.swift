@@ -402,6 +402,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     @Published private(set) var isPaused = false
     @Published private(set) var showScreenshotSavedBanner = false
     @Published private(set) var pausedPreviewImage: CGImage?
+    @Published private(set) var screenshotOverlayImage: CGImage?
     @Published private(set) var computeDebugLine = "Compute: unknown"
     @Published private(set) var requestedComputeDebugLine = "Requested Compute: MPS"
     @Published private(set) var pythonDebugLine = "Python: resolving..."
@@ -446,6 +447,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         didFallbackToCPU = false
         isRestartingPythonBridge = false
         pausedPreviewImage = nil
+        screenshotOverlayImage = nil
         pausedDisplayFPS = 0
         pausedDisplayElapsed = 0
         computeDebugLine = "Compute: initializing..."
@@ -476,6 +478,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             self.pendingPauseFrameCapture = false
             DispatchQueue.main.async { [weak self] in
                 self?.pausedPreviewImage = nil
+                self?.screenshotOverlayImage = nil
             }
         }
     }
@@ -984,7 +987,30 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     }
 
     nonisolated private func saveScreenshot(pixelBuffer: CVPixelBuffer, frameNumber: Int) {
-#if os(macOS) || os(iOS)
+#if os(macOS)
+        if pausedForInference {
+            Task { @MainActor [weak self] in
+                self?.saveWindowScreenshot(frameNumber: frameNumber)
+            }
+            return
+        }
+
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+            publishStatus("Screenshot failed: unable to convert frame.")
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.screenshotOverlayImage = cgImage
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.saveWindowScreenshot(frameNumber: frameNumber)
+                self.screenshotOverlayImage = nil
+            }
+        }
+#elseif os(iOS)
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
             publishStatus("Screenshot failed: unable to convert frame.")
@@ -1030,6 +1056,46 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     }
 
 #if os(macOS)
+    @MainActor
+    private func saveWindowScreenshot(frameNumber: Int) {
+        guard let window = NSApplication.shared.keyWindow,
+              let contentView = window.contentView
+        else {
+            statusMessage = "Screenshot failed: app window is not active."
+            return
+        }
+
+        let bounds = contentView.bounds
+        guard let bitmapRep = contentView.bitmapImageRepForCachingDisplay(in: bounds) else {
+            statusMessage = "Screenshot failed: unable to create bitmap."
+            return
+        }
+
+        contentView.cacheDisplay(in: bounds, to: bitmapRep)
+        guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else {
+            statusMessage = "Screenshot failed: png encoding failed."
+            return
+        }
+
+        do {
+            let screenshotFolder = FileManager.default
+                .urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("screenshots", isDirectory: true)
+            try FileManager.default.createDirectory(at: screenshotFolder, withIntermediateDirectories: true)
+            let timestamp = Self.timestampFormatter.string(from: Date())
+            let fileURL = screenshotFolder.appendingPathComponent("1-YOLO26N_\(timestamp)_\(frameNumber).png")
+            try pngData.write(to: fileURL)
+
+            showScreenshotSavedBanner = true
+            statusMessage = "Screenshot saved to \(fileURL.path)"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.showScreenshotSavedBanner = false
+            }
+        } catch {
+            statusMessage = "Screenshot failed: \(error.localizedDescription)"
+        }
+    }
+
     private func installKeyboardMonitorIfNeeded() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
