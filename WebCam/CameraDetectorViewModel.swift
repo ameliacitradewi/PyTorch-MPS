@@ -401,6 +401,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     @Published private(set) var elapsedSeconds: Double = 0
     @Published private(set) var isPaused = false
     @Published private(set) var showScreenshotSavedBanner = false
+    @Published private(set) var pausedPreviewImage: CGImage?
     @Published private(set) var computeDebugLine = "Compute: unknown"
     @Published private(set) var requestedComputeDebugLine = "Requested Compute: MPS"
     @Published private(set) var pythonDebugLine = "Python: resolving..."
@@ -428,6 +429,9 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var sessionStartTime = CACurrentMediaTime()
     nonisolated(unsafe) private var pausedForInference = false
     nonisolated(unsafe) private var pendingScreenshot = false
+    nonisolated(unsafe) private var pendingPauseFrameCapture = false
+    nonisolated(unsafe) private var pausedDisplayFPS: Double = 0
+    nonisolated(unsafe) private var pausedDisplayElapsed: Double = 0
 
     nonisolated private let confidenceThreshold = 0.25
     nonisolated private let iouThreshold = 0.45
@@ -441,6 +445,9 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         pythonDevicePreference = initialPythonDevicePreference()
         didFallbackToCPU = false
         isRestartingPythonBridge = false
+        pausedPreviewImage = nil
+        pausedDisplayFPS = 0
+        pausedDisplayElapsed = 0
         computeDebugLine = "Compute: initializing..."
         requestedComputeDebugLine = "Requested Compute: \(pythonDevicePreference.uppercased())"
         pythonDebugLine = "Python: resolving..."
@@ -466,6 +473,10 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             self.pythonBridge?.stop()
             self.pythonBridge = nil
             self.isRestartingPythonBridge = false
+            self.pendingPauseFrameCapture = false
+            DispatchQueue.main.async { [weak self] in
+                self?.pausedPreviewImage = nil
+            }
         }
     }
 
@@ -473,8 +484,24 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         let nextState = !isPaused
         isPaused = nextState
         statusMessage = nextState ? "YOLO26N Live Detection (PAUSED)" : "YOLO26N Live Detection"
+
+        if !nextState {
+            pausedPreviewImage = nil
+        }
+        if nextState {
+            pausedDisplayFPS = fps
+            pausedDisplayElapsed = elapsedSeconds
+        }
+
         inferenceQueue.async { [weak self] in
-            self?.pausedForInference = nextState
+            guard let self else { return }
+            if nextState {
+                self.pendingPauseFrameCapture = true
+                self.pausedForInference = true
+            } else {
+                self.pendingPauseFrameCapture = false
+                self.pausedForInference = false
+            }
         }
     }
 
@@ -1050,8 +1077,33 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
             return
         }
 
-        frameCount += 1
         let now = CACurrentMediaTime()
+
+        if pendingScreenshot {
+            pendingScreenshot = false
+            saveScreenshot(pixelBuffer: pixelBuffer, frameNumber: frameCount)
+        }
+
+        if pendingPauseFrameCapture {
+            pendingPauseFrameCapture = false
+            let image = CIImage(cvPixelBuffer: pixelBuffer)
+            if let cgImage = ciContext.createCGImage(image, from: image.extent) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.pausedPreviewImage = cgImage
+                }
+            }
+        }
+
+        if pausedForInference {
+            publishFrameState(
+                detections: lastDetections,
+                fps: pausedDisplayFPS,
+                elapsed: max(0, now - sessionStartTime)
+            )
+            return
+        }
+
+        frameCount += 1
         frameTimestamps.append(now)
         if frameTimestamps.count > 30 {
             frameTimestamps.removeFirst(frameTimestamps.count - 30)
@@ -1059,16 +1111,6 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
 
         let rollingFPS = Self.rollingFPS(from: frameTimestamps)
         let elapsed = max(0, now - sessionStartTime)
-
-        if pendingScreenshot {
-            pendingScreenshot = false
-            saveScreenshot(pixelBuffer: pixelBuffer, frameNumber: frameCount)
-        }
-
-        if pausedForInference {
-            publishFrameState(detections: lastDetections, fps: rollingFPS, elapsed: elapsed)
-            return
-        }
 
         if skipNextInference {
             skipNextInference = false

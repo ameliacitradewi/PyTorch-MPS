@@ -18,6 +18,17 @@ struct ContentView: View {
             CameraPreview(session: detector.session)
                 .ignoresSafeArea()
 
+            if detector.isPaused, let pausedImage = detector.pausedPreviewImage {
+                GeometryReader { geometry in
+                    Image(decorative: pausedImage, scale: 1.0)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                }
+                .ignoresSafeArea()
+            }
+
             DetectionOverlay(detections: detector.detections)
                 .allowsHitTesting(false)
                 .ignoresSafeArea()
