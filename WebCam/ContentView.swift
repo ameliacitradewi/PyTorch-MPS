@@ -92,6 +92,13 @@ struct ContentView: View {
 
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
+                        if detector.showScreenshotSavedBanner {
+                            Text("SCREENSHOT SAVED!")
+                                .font(.title3)
+                                .fontWeight(.bold)
+                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.4))
+                        }
+
                         Text("Persons: \(detector.isPaused ? "—" : "\(detector.personCount)")")
                             .font(.largeTitle)
                             .fontWeight(.bold)
@@ -111,13 +118,6 @@ struct ContentView: View {
                             .font(.title3)
                             .foregroundStyle(.white)
                             .monospacedDigit()
-
-                        if detector.showScreenshotSavedBanner {
-                            Text("SCREENSHOT SAVED!")
-                                .font(.title3)
-                                .fontWeight(.bold)
-                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.4))
-                        }
                     }
 
                     Spacer()
