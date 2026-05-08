@@ -59,6 +59,8 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private let jsonEncoder = JSONEncoder()
     private let jsonDecoder = JSONDecoder()
+    private let maxEncodedFrameDimension: CGFloat = 640
+    private let encodedJPEGQuality: CGFloat = 0.58
 
     private var process: Process?
     private var stdinHandle: FileHandle?
@@ -220,7 +222,13 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
 
     private func encodeJPEG(from pixelBuffer: CVPixelBuffer) -> Data? {
         let image = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+        let extent = image.extent
+        let maxDimension = max(extent.width, extent.height)
+        let scale = maxDimension > maxEncodedFrameDimension ? (maxEncodedFrameDimension / maxDimension) : 1.0
+        let processedImage = scale < 0.999 ? image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) : image
+        let processedExtent = processedImage.extent.integral
+
+        guard let cgImage = ciContext.createCGImage(processedImage, from: processedExtent) else {
             return nil
         }
 
@@ -234,7 +242,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             return nil
         }
 
-        let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.72]
+        let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: encodedJPEGQuality]
         CGImageDestinationAddImage(destination, cgImage, options as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
             return nil
@@ -416,7 +424,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
     nonisolated(unsafe) private var model: MLModel?
     nonisolated(unsafe) private var isSessionConfigured = false
-    nonisolated private let inferenceIntervalFrames = 5
+    nonisolated private let inferenceIntervalFrames = 2
     nonisolated(unsafe) private var framesUntilNextInference = 0
     nonisolated(unsafe) private var lastDetections: [DetectionDisplay] = []
     nonisolated(unsafe) private var inferenceTimestamps: [CFTimeInterval] = []
@@ -722,36 +730,70 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
                 mediaType: .video,
                 position: .back
             )
+            cameraDebug("iOS discovered \(discovery.devices.count) camera device(s).")
             return discovery.devices.first ?? AVCaptureDevice.default(for: .video)
 #else
+            var deviceTypes: [AVCaptureDevice.DeviceType] = [.external, .builtInWideAngleCamera]
+            if #available(macOS 13.0, *) {
+                deviceTypes.insert(.continuityCamera, at: 0)
+            }
+            cameraDebug("macOS camera discovery deviceTypes=\(deviceTypes.map(\.rawValue).joined(separator: ", "))")
             let discovery = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.external, .builtInWideAngleCamera],
+                deviceTypes: deviceTypes,
                 mediaType: .video,
                 position: .unspecified
             )
             let devices = discovery.devices
+            cameraDebug("macOS discovered \(devices.count) camera device(s).")
+            for (index, device) in devices.enumerated() {
+                cameraDebug("Candidate[\(index)] \(describeCamera(device))")
+            }
+            if let iphoneCamera = devices.first(where: {
+                let name = $0.localizedName.lowercased()
+                return name.contains("iphone") || name.contains("continuity")
+            }) {
+                cameraDebug("Selected iPhone/Continuity camera by name match: \(describeCamera(iphoneCamera))")
+                return iphoneCamera
+            }
+            if #available(macOS 13.0, *),
+               let continuityCamera = devices.first(where: { $0.deviceType == .continuityCamera }) {
+                cameraDebug("Selected continuityCamera by device type: \(describeCamera(continuityCamera))")
+                return continuityCamera
+            }
             if let external = devices.first(where: { $0.deviceType == .external }) {
+                cameraDebug("Selected external camera: \(describeCamera(external))")
                 return external
             }
             if let builtIn = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) {
+                cameraDebug("Selected built-in wide camera: \(describeCamera(builtIn))")
                 return builtIn
             }
+            if let fallback = devices.first ?? AVCaptureDevice.default(for: .video) {
+                cameraDebug("Selected fallback camera: \(describeCamera(fallback))")
+                return fallback
+            }
+            cameraDebug("No camera selected from discovery or default.")
             return devices.first ?? AVCaptureDevice.default(for: .video)
 #endif
         }()
         guard let cameraDevice = preferredDevice else {
+            cameraDebug("No camera device found after selection.")
             publishStatus("No camera device found.")
             return false
         }
+        cameraDebug("Final selected camera: \(describeCamera(cameraDevice))")
 
         do {
             let cameraInput = try AVCaptureDeviceInput(device: cameraDevice)
             guard session.canAddInput(cameraInput) else {
+                cameraDebug("Cannot add selected camera input: \(describeCamera(cameraDevice))")
                 publishStatus("Unable to attach camera input.")
                 return false
             }
             session.addInput(cameraInput)
+            cameraDebug("Attached camera input: \(describeCamera(cameraDevice))")
         } catch {
+            cameraDebug("Camera input creation failed: \(error.localizedDescription)")
             publishStatus("Camera input error: \(error.localizedDescription)")
             return false
         }
@@ -782,6 +824,23 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
         isSessionConfigured = true
         return true
+    }
+
+    nonisolated private func cameraDebug(_ message: String) {
+        print("[CameraDebug] \(message)")
+    }
+
+    nonisolated private func describeCamera(_ device: AVCaptureDevice) -> String {
+        let positionDescription: String
+        switch device.position {
+        case .front:
+            positionDescription = "front"
+        case .back:
+            positionDescription = "back"
+        default:
+            positionDescription = "unspecified"
+        }
+        return "name='\(device.localizedName)', type='\(device.deviceType.rawValue)', position=\(positionDescription), id='\(device.uniqueID)'"
     }
 
     nonisolated private func loadModelIfNeeded() throws {
