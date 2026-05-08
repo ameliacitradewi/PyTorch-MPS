@@ -26,7 +26,6 @@ struct DetectionDisplay: Identifiable, Sendable {
 private nonisolated struct PythonFrameRequest: Encodable {
     let frame_id: Int
     let conf: Double
-    let iou: Double
     let jpeg_b64: String
 }
 
@@ -75,7 +74,6 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
         scriptURL: URL,
         modelURL: URL,
         confidenceThreshold: Double,
-        iouThreshold: Double,
         preferredDevice: String
     ) throws {
         var thrownError: Error?
@@ -98,7 +96,6 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             var environment = ProcessInfo.processInfo.environment
             environment["YOLO_MODEL_PATH"] = modelURL.path
             environment["YOLO_CONF_THRESHOLD"] = String(confidenceThreshold)
-            environment["YOLO_IOU_THRESHOLD"] = String(iouThreshold)
             environment["YOLO_TARGET_KEYWORDS"] = "person,human,body,face,head,hand,arm,leg,foot"
             environment["YOLO_CONFIG_DIR"] = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ultralytics-config", isDirectory: true).path
@@ -182,8 +179,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     func sendFrame(
         pixelBuffer: CVPixelBuffer,
         frameID: Int,
-        confidenceThreshold: Double,
-        iouThreshold: Double
+        confidenceThreshold: Double
     ) -> Bool {
         let canSend = stateQueue.sync { () -> Bool in
             guard let process, process.isRunning else { return false }
@@ -199,7 +195,6 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
         let request = PythonFrameRequest(
             frame_id: frameID,
             conf: confidenceThreshold,
-            iou: iouThreshold,
             jpeg_b64: jpegData.base64EncodedString()
         )
 
@@ -435,7 +430,6 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var pausedDisplayElapsed: Double = 0
 
     nonisolated private let confidenceThreshold = 0.5
-    nonisolated private let iouThreshold = 0.45
 
 #if os(macOS)
     private var keyMonitor: Any?
@@ -601,7 +595,6 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             scriptURL: scriptURL,
             modelURL: modelURL,
             confidenceThreshold: confidenceThreshold,
-            iouThreshold: iouThreshold,
             preferredDevice: pythonDevicePreference
         )
         pythonBridge = bridge
@@ -1196,8 +1189,7 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
         if pythonBridge.sendFrame(
             pixelBuffer: pixelBuffer,
             frameID: frameCount,
-            confidenceThreshold: confidenceThreshold,
-            iouThreshold: iouThreshold
+            confidenceThreshold: confidenceThreshold
         ) {
             inferenceCount += 1
             inferenceTimestamps.append(now)

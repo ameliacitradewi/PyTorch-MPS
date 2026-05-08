@@ -82,7 +82,6 @@ def main():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     conf_default = float(os.environ.get("YOLO_CONF_THRESHOLD", "0.5"))
-    iou_default = float(os.environ.get("YOLO_IOU_THRESHOLD", "0.45"))
     preferred_device = os.environ.get("YOLO_DEVICE", "mps").strip().lower()
     keyword_text = os.environ.get(
         "YOLO_TARGET_KEYWORDS",
@@ -120,7 +119,6 @@ def main():
             request = json.loads(line)
             frame_id = int(request.get("frame_id", -1))
             conf = float(request.get("conf", conf_default))
-            iou = float(request.get("iou", iou_default))
             jpeg_b64 = request.get("jpeg_b64")
             if not jpeg_b64:
                 raise ValueError("jpeg_b64 is missing.")
@@ -136,7 +134,6 @@ def main():
                 result = model(
                     frame,
                     conf=conf,
-                    iou=iou,
                     classes=target_ids if target_ids else None,
                     device=device,
                     verbose=False,
