@@ -434,7 +434,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var pausedDisplayFPS: Double = 0
     nonisolated(unsafe) private var pausedDisplayElapsed: Double = 0
 
-    nonisolated private let confidenceThreshold = 0.25
+    nonisolated private let confidenceThreshold = 0.5
     nonisolated private let iouThreshold = 0.45
 
 #if os(macOS)
