@@ -416,7 +416,8 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
     nonisolated(unsafe) private var model: MLModel?
     nonisolated(unsafe) private var isSessionConfigured = false
-    nonisolated(unsafe) private var skipNextInference = false
+    nonisolated private let inferenceIntervalFrames = 5
+    nonisolated(unsafe) private var framesUntilNextInference = 0
     nonisolated(unsafe) private var lastDetections: [DetectionDisplay] = []
     nonisolated(unsafe) private var inferenceTimestamps: [CFTimeInterval] = []
     nonisolated(unsafe) private var frameCount = 0
@@ -440,6 +441,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         pythonDevicePreference = initialPythonDevicePreference()
         didFallbackToCPU = false
         isRestartingPythonBridge = false
+        framesUntilNextInference = 0
         pausedPreviewImage = nil
         screenshotOverlayImage = nil
         pausedDisplayFPS = 0
@@ -1173,12 +1175,12 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
         let rollingFPS = Self.rollingFPS(from: inferenceTimestamps)
         let elapsed = max(0, now - sessionStartTime)
 
-        if skipNextInference {
-            skipNextInference = false
+        if framesUntilNextInference > 0 {
+            framesUntilNextInference -= 1
             publishFrameState(detections: lastDetections, fps: rollingFPS, elapsed: elapsed)
             return
         }
-        skipNextInference = true
+        framesUntilNextInference = max(0, inferenceIntervalFrames - 1)
 
         guard let pythonBridge else {
             publishStatus("Python detector is unavailable.")
