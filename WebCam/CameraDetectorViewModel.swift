@@ -423,7 +423,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var isSessionConfigured = false
     nonisolated(unsafe) private var skipNextInference = false
     nonisolated(unsafe) private var lastDetections: [DetectionDisplay] = []
-    nonisolated(unsafe) private var frameTimestamps: [CFTimeInterval] = []
+    nonisolated(unsafe) private var inferenceTimestamps: [CFTimeInterval] = []
     nonisolated(unsafe) private var frameCount = 0
     nonisolated(unsafe) private var inferenceCount = 0
     nonisolated(unsafe) private var totalPersonDetections = 0
@@ -553,7 +553,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             }
 
             self.sessionStartTime = CACurrentMediaTime()
-            self.frameTimestamps.removeAll(keepingCapacity: true)
+            self.inferenceTimestamps.removeAll(keepingCapacity: true)
 
             do {
                 try self.startPythonBridgeIfNeeded()
@@ -730,11 +730,18 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             return discovery.devices.first ?? AVCaptureDevice.default(for: .video)
 #else
             let discovery = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.builtInWideAngleCamera, .external],
+                deviceTypes: [.external, .builtInWideAngleCamera],
                 mediaType: .video,
                 position: .unspecified
             )
-            return discovery.devices.first ?? AVCaptureDevice.default(for: .video)
+            let devices = discovery.devices
+            if let external = devices.first(where: { $0.deviceType == .external }) {
+                return external
+            }
+            if let builtIn = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) {
+                return builtIn
+            }
+            return devices.first ?? AVCaptureDevice.default(for: .video)
 #endif
         }()
         guard let cameraDevice = preferredDevice else {
@@ -1170,12 +1177,7 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
         }
 
         frameCount += 1
-        frameTimestamps.append(now)
-        if frameTimestamps.count > 30 {
-            frameTimestamps.removeFirst(frameTimestamps.count - 30)
-        }
-
-        let rollingFPS = Self.rollingFPS(from: frameTimestamps)
+        let rollingFPS = Self.rollingFPS(from: inferenceTimestamps)
         let elapsed = max(0, now - sessionStartTime)
 
         if skipNextInference {
@@ -1198,6 +1200,10 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
             iouThreshold: iouThreshold
         ) {
             inferenceCount += 1
+            inferenceTimestamps.append(now)
+            if inferenceTimestamps.count > 30 {
+                inferenceTimestamps.removeFirst(inferenceTimestamps.count - 30)
+            }
         }
 
         lastDetections = latestPythonDetections
@@ -1205,7 +1211,7 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
 
         publishFrameState(
             detections: lastDetections,
-            fps: rollingFPS,
+            fps: Self.rollingFPS(from: inferenceTimestamps),
             elapsed: elapsed
         )
     }
