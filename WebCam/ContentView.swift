@@ -30,9 +30,7 @@ struct ContentView: View {
                 GeometryReader { geometry in
                     Image(decorative: screenshotImage, scale: 1.0)
                         .resizable()
-                        .scaledToFill()
                         .frame(width: geometry.size.width, height: geometry.size.height)
-                        .clipped()
                 }
                 .ignoresSafeArea()
             }
@@ -41,9 +39,7 @@ struct ContentView: View {
                 GeometryReader { geometry in
                     Image(decorative: pausedImage, scale: 1.0)
                         .resizable()
-                        .scaledToFill()
                         .frame(width: geometry.size.width, height: geometry.size.height)
-                        .clipped()
                 }
                 .ignoresSafeArea()
             }
