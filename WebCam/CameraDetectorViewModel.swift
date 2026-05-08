@@ -104,6 +104,10 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
                 .appendingPathComponent("ultralytics-config", isDirectory: true).path
             environment["PYTHONUNBUFFERED"] = "1"
             environment["YOLO_DEVICE"] = preferredDevice
+            environment["METAL_DEVICE_WRAPPER_TYPE"] = "0"
+            environment["MTL_DEBUG_LAYER"] = "0"
+            environment["MTL_SHADER_VALIDATION"] = "0"
+            environment.removeValue(forKey: "PYTHONPATH")
             process.environment = environment
 
             let stdinPipe = Pipe()
@@ -363,7 +367,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     private func pythonHasDependencies(path: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["-c", "import torch, ultralytics, cv2, numpy"]
+        process.arguments = ["-c", "import torch, ultralytics, cv2, numpy, PIL"]
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -427,7 +431,6 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
     nonisolated private let confidenceThreshold = 0.25
     nonisolated private let iouThreshold = 0.45
-    nonisolated private static let disableMPSKey = "WebCam.DisableMPSAfterCrash"
 
 #if os(macOS)
     private var keyMonitor: Any?
@@ -596,7 +599,6 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
             self.publishStatus("MPS backend crashed. Restarting detector on CPU...")
             self.publishComputeDebug("Compute: GPU (MPS) crashed, falling back to CPU")
-            UserDefaults.standard.set(true, forKey: Self.disableMPSKey)
             self.pythonBridge?.stop()
             self.pythonBridge = nil
             self.pythonDevicePreference = "cpu"
@@ -616,19 +618,10 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         let env = ProcessInfo.processInfo.environment
         if let forced = env["WEBCAM_INFERENCE_DEVICE"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
            forced == "mps" || forced == "cpu" {
-            if forced == "mps" {
-                UserDefaults.standard.set(false, forKey: Self.disableMPSKey)
-            }
             return forced
         }
-
-        // Avoid recurring macOS crash popups after a known MPS hard-crash.
-        if UserDefaults.standard.bool(forKey: Self.disableMPSKey) {
-            return "cpu"
-        }
-
-        // Default to CPU-safe mode unless explicitly forced to MPS.
-        return "cpu"
+        // Default behavior: prefer Apple GPU via MPS.
+        return "mps"
     }
 
     nonisolated private func handlePythonStatus(_ message: String) {

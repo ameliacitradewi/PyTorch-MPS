@@ -185,3 +185,4 @@ if __name__ == "__main__":
         log_stderr("Fatal detector error: " + str(fatal_error))
         log_stderr(traceback.format_exc())
         emit_json({"frame_id": -1, "detections": [], "error": str(fatal_error)})
+        sys.exit(1)
