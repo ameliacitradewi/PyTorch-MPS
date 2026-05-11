@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 import traceback
 
 def log_stderr(message: str) -> None:
@@ -107,6 +108,13 @@ def main():
         }
     )
 
+    perf_window_count = 0
+    perf_decode_total_ms = 0.0
+    perf_infer_total_ms = 0.0
+    perf_post_total_ms = 0.0
+    perf_total_total_ms = 0.0
+    perf_log_interval = 20
+
     for raw_line in sys.stdin.buffer:
         if not raw_line:
             break
@@ -116,6 +124,7 @@ def main():
 
         frame_id = None
         try:
+            frame_start = time.perf_counter()
             request = json.loads(line)
             frame_id = int(request.get("frame_id", -1))
             conf = float(request.get("conf", conf_default))
@@ -128,6 +137,7 @@ def main():
             frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
             if frame is None:
                 raise RuntimeError("Failed to decode JPEG frame.")
+            decode_done = time.perf_counter()
 
             height, width = frame.shape[:2]
             with contextlib.redirect_stdout(sys.stderr):
@@ -138,6 +148,7 @@ def main():
                     device=device,
                     verbose=False,
                 )[0]
+            infer_done = time.perf_counter()
 
             detections = []
             boxes = result.boxes
@@ -166,6 +177,32 @@ def main():
                             "h": (y2 - y1) / height,
                         }
                     )
+            post_done = time.perf_counter()
+
+            decode_ms = (decode_done - frame_start) * 1000.0
+            infer_ms = (infer_done - decode_done) * 1000.0
+            post_ms = (post_done - infer_done) * 1000.0
+            total_ms = (post_done - frame_start) * 1000.0
+
+            perf_window_count += 1
+            perf_decode_total_ms += decode_ms
+            perf_infer_total_ms += infer_ms
+            perf_post_total_ms += post_ms
+            perf_total_total_ms += total_ms
+
+            if perf_window_count >= perf_log_interval:
+                log_stderr(
+                    "[PyPerf] avg over "
+                    f"{perf_window_count} frames | decode {perf_decode_total_ms / perf_window_count:.1f} ms"
+                    f" | infer {perf_infer_total_ms / perf_window_count:.1f} ms"
+                    f" | post {perf_post_total_ms / perf_window_count:.1f} ms"
+                    f" | total {perf_total_total_ms / perf_window_count:.1f} ms"
+                )
+                perf_window_count = 0
+                perf_decode_total_ms = 0.0
+                perf_infer_total_ms = 0.0
+                perf_post_total_ms = 0.0
+                perf_total_total_ms = 0.0
 
             emit_json({"frame_id": frame_id, "detections": detections})
 

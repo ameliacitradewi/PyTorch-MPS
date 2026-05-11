@@ -69,6 +69,15 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     private var isReady = false
     private var awaitingResponse = false
     private var lastStderrLine = ""
+    private var pendingRequestStartTime: CFTimeInterval = 0
+    private var pendingEncodeDurationMs: Double = 0
+    private var pendingPayloadKB: Double = 0
+    private var bridgePerfSampleCount = 0
+    private var bridgePerfEncodeTotalMs: Double = 0
+    private var bridgePerfRoundTripTotalMs: Double = 0
+    private var bridgePerfPayloadTotalKB: Double = 0
+    private var bridgePerfDetectionTotal = 0
+    private let bridgePerfReportInterval = 20
 
     init() {}
 
@@ -133,6 +142,14 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             self.isReady = false
             self.awaitingResponse = false
             self.lastStderrLine = ""
+            self.pendingRequestStartTime = 0
+            self.pendingEncodeDurationMs = 0
+            self.pendingPayloadKB = 0
+            self.bridgePerfSampleCount = 0
+            self.bridgePerfEncodeTotalMs = 0
+            self.bridgePerfRoundTripTotalMs = 0
+            self.bridgePerfPayloadTotalKB = 0
+            self.bridgePerfDetectionTotal = 0
             self.onStatus?("Using Python: \(pythonExecutable)")
             self.onStatus?("Requested device: \(preferredDevice)")
 
@@ -175,6 +192,9 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             isReady = false
             awaitingResponse = false
             lastStderrLine = ""
+            pendingRequestStartTime = 0
+            pendingEncodeDurationMs = 0
+            pendingPayloadKB = 0
         }
     }
 
@@ -189,10 +209,12 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
         }
         guard canSend else { return false }
 
+        let encodeStart = CACurrentMediaTime()
         guard let jpegData = encodeJPEG(from: pixelBuffer) else {
             onError?("Failed to encode frame as JPEG.")
             return false
         }
+        let encodeDurationMs = (CACurrentMediaTime() - encodeStart) * 1000
 
         let request = PythonFrameRequest(
             frame_id: frameID,
@@ -205,6 +227,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             return false
         }
         payload.append(0x0A)
+        let payloadKB = Double(payload.count) / 1024.0
 
         var didWrite = false
         stateQueue.sync {
@@ -212,6 +235,9 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             do {
                 try stdinHandle.write(contentsOf: payload)
                 awaitingResponse = true
+                pendingRequestStartTime = CACurrentMediaTime()
+                pendingEncodeDurationMs = encodeDurationMs
+                pendingPayloadKB = payloadKB
                 didWrite = true
             } catch {
                 onError?("Failed to write frame to Python worker: \(error.localizedDescription)")
@@ -257,6 +283,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             self.process = nil
             self.isReady = false
             self.awaitingResponse = false
+            self.pendingRequestStartTime = 0
             let detail = self.lastStderrLine.isEmpty ? "" : " Last stderr: \(self.lastStderrLine)"
             self.onError?("Python worker terminated with status \(process.terminationStatus).\(detail)")
         }
@@ -278,6 +305,10 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             stderrBuffer.removeSubrange(...newlineIndex)
             if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
                 lastStderrLine = line
+                if line.hasPrefix("[PyPerf]") || line.hasPrefix("[PerfDebug]") {
+                    print(line)
+                    continue
+                }
                 onStatus?("PyTorch: \(line)")
             }
         }
@@ -309,6 +340,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
 
         if let error = response.error, !error.isEmpty {
             awaitingResponse = false
+            pendingRequestStartTime = 0
             onError?(error)
             return
         }
@@ -328,8 +360,48 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
                 boundingBox: CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
             )
         }
+        let roundTripMs: Double
+        if pendingRequestStartTime > 0 {
+            roundTripMs = (CACurrentMediaTime() - pendingRequestStartTime) * 1000
+        } else {
+            roundTripMs = 0
+        }
+        recordBridgePerfSample(roundTripMs: roundTripMs, detectionCount: mapped.count)
         awaitingResponse = false
+        pendingRequestStartTime = 0
         onDetections?(mapped)
+    }
+
+    private func recordBridgePerfSample(roundTripMs: Double, detectionCount: Int) {
+        bridgePerfSampleCount += 1
+        bridgePerfEncodeTotalMs += pendingEncodeDurationMs
+        bridgePerfRoundTripTotalMs += roundTripMs
+        bridgePerfPayloadTotalKB += pendingPayloadKB
+        bridgePerfDetectionTotal += detectionCount
+
+        guard bridgePerfSampleCount >= bridgePerfReportInterval else { return }
+
+        let samples = Double(bridgePerfSampleCount)
+        let avgEncode = bridgePerfEncodeTotalMs / samples
+        let avgRoundTrip = bridgePerfRoundTripTotalMs / samples
+        let avgPayloadKB = bridgePerfPayloadTotalKB / samples
+        let avgDetections = Double(bridgePerfDetectionTotal) / samples
+        print(
+            String(
+                format: "[PerfDebug] Bridge avg over %d sends | encode %.1f ms | roundtrip %.1f ms | payload %.1f KB | detections %.2f",
+                bridgePerfSampleCount,
+                avgEncode,
+                avgRoundTrip,
+                avgPayloadKB,
+                avgDetections
+            )
+        )
+
+        bridgePerfSampleCount = 0
+        bridgePerfEncodeTotalMs = 0
+        bridgePerfRoundTripTotalMs = 0
+        bridgePerfPayloadTotalKB = 0
+        bridgePerfDetectionTotal = 0
     }
 
     private func resolvePythonExecutable() throws -> String {
@@ -430,6 +502,8 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var inferenceTimestamps: [CFTimeInterval] = []
     nonisolated(unsafe) private var frameCount = 0
     nonisolated(unsafe) private var inferenceCount = 0
+    nonisolated(unsafe) private var inferenceSendAttemptCount = 0
+    nonisolated(unsafe) private var inferenceSendSkippedCount = 0
     nonisolated(unsafe) private var totalPersonDetections = 0
     nonisolated(unsafe) private var sessionStartTime = CACurrentMediaTime()
     nonisolated(unsafe) private var pausedForInference = false
@@ -450,6 +524,8 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         didFallbackToCPU = false
         isRestartingPythonBridge = false
         framesUntilNextInference = 0
+        inferenceSendAttemptCount = 0
+        inferenceSendSkippedCount = 0
         pausedPreviewImage = nil
         screenshotOverlayImage = nil
         pausedDisplayFPS = 0
@@ -1252,11 +1328,29 @@ extension CameraDetectorViewModel: AVCaptureVideoDataOutputSampleBufferDelegate 
             frameID: frameCount,
             confidenceThreshold: confidenceThreshold
         ) {
+            inferenceSendAttemptCount += 1
             inferenceCount += 1
             inferenceTimestamps.append(now)
             if inferenceTimestamps.count > 30 {
                 inferenceTimestamps.removeFirst(inferenceTimestamps.count - 30)
             }
+        } else {
+            inferenceSendAttemptCount += 1
+            inferenceSendSkippedCount += 1
+        }
+
+        if inferenceSendAttemptCount > 0, inferenceSendAttemptCount % 30 == 0 {
+            let sentCount = inferenceSendAttemptCount - inferenceSendSkippedCount
+            let skipRate = (Double(inferenceSendSkippedCount) / Double(inferenceSendAttemptCount)) * 100
+            print(
+                String(
+                    format: "[PerfDebug] Inference send attempts=%d sent=%d skipped=%d (%.1f%%)",
+                    inferenceSendAttemptCount,
+                    sentCount,
+                    inferenceSendSkippedCount,
+                    skipRate
+                )
+            )
         }
 
         lastDetections = latestPythonDetections
