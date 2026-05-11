@@ -317,6 +317,8 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     private func parseStdoutLine(_ data: Data) {
         guard !data.isEmpty else { return }
         guard let response = try? jsonDecoder.decode(PythonFrameResponse.self, from: data) else {
+            let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            onError?("Unexpected Python stdout: \(raw.prefix(300))")
             return
         }
 
@@ -413,6 +415,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
         }
 
         candidates.append(contentsOf: [
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3",
             "/opt/anaconda3/bin/python3",
             "/usr/local/bin/python3",

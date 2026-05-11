@@ -51,8 +51,8 @@ def select_target_ids(names_map, keyword_text: str):
         if any(keyword in lower_name for keyword in keywords):
             target_ids.append(class_id)
 
-    # Always include class 0 if it is person-like in COCO-style models.
-    if 0 in names_map and "person" in names_map[0].lower() and 0 not in target_ids:
+    # Keep class 0 when it is person-like in COCO-style models.
+    if 0 in names_map and "person" in names_map[0].lower():
         target_ids.append(0)
 
     return sorted(set(target_ids))
@@ -95,6 +95,8 @@ def main():
     device = choose_device(torch, preferred_device)
     model.to(device)
     names_map = normalize_names(model.names)
+    if not names_map:
+        log_stderr("Warning: model.names could not be normalized; class filtering disabled.")
     target_ids = select_target_ids(names_map, keyword_text)
     log_stderr(f"Device: {device}")
     log_stderr(f"Target class IDs: {target_ids if target_ids else 'all'}")
@@ -122,10 +124,12 @@ def main():
         if not line:
             continue
 
-        frame_id = None
+        frame_id = -1
         try:
             frame_start = time.perf_counter()
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("Input JSON must be an object.")
             frame_id = int(request.get("frame_id", -1))
             conf = float(request.get("conf", conf_default))
             jpeg_b64 = request.get("jpeg_b64")
