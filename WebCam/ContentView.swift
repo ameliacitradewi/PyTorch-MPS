@@ -177,7 +177,7 @@ private struct DetectionOverlay: View {
                         .stroke(Color(red: 0.0, green: 1.0, blue: 0.0), lineWidth: 2)
                         .frame(width: rect.width, height: rect.height)
 
-                    Text("\(detection.label) \(Int(detection.confidence * 100))%")
+                    Text("\(detection.label) - \(Int(detection.confidence * 100))%")
                         .font(.title3)
                         .bold()
                         .padding(.horizontal, 8)

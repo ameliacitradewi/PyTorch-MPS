@@ -31,6 +31,7 @@ private nonisolated struct PythonFrameRequest: Encodable {
 
 private nonisolated struct PythonDetectionPayload: Decodable {
     let label: String
+    let track_id: Int?
     let confidence: Double
     let x: Double
     let y: Double
@@ -355,9 +356,16 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             let clampedW = min(max(payload.w, 0), 1)
             let clampedH = min(max(payload.h, 0), 1)
             guard clampedW > 0.001, clampedH > 0.001 else { return nil }
+            let baseLabel = payload.label.capitalized
+            let displayLabel: String
+            if let trackID = payload.track_id {
+                displayLabel = "ID \(trackID) - \(baseLabel)"
+            } else {
+                displayLabel = baseLabel
+            }
 
             return DetectionDisplay(
-                label: payload.label.capitalized,
+                label: displayLabel,
                 confidence: payload.confidence,
                 boundingBox: CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
             )

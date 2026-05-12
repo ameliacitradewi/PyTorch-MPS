@@ -63,6 +63,44 @@ def emit_json(payload):
     sys.stdout.flush()
 
 
+def extract_color_signature(frame, x1, y1, x2, y2, cv2_module, np_module):
+    ix1 = max(0, int(x1))
+    iy1 = max(0, int(y1))
+    ix2 = min(frame.shape[1], int(x2))
+    iy2 = min(frame.shape[0], int(y2))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return None
+
+    roi = frame[iy1:iy2, ix1:ix2]
+    if roi.size == 0:
+        return None
+
+    roi_h, roi_w = roi.shape[:2]
+    margin_x = int(roi_w * 0.15)
+    margin_y = int(roi_h * 0.15)
+    if roi_w - (2 * margin_x) > 3 and roi_h - (2 * margin_y) > 3:
+        roi = roi[margin_y:roi_h - margin_y, margin_x:roi_w - margin_x]
+
+    sampled = roi[::2, ::2]
+    if sampled.size == 0:
+        sampled = roi
+
+    hsv = cv2_module.cvtColor(sampled, cv2_module.COLOR_BGR2HSV)
+    flat = hsv.reshape(-1, 3)
+    return np_module.median(flat, axis=0).astype(np_module.float32)
+
+
+def hsv_distance(hsv_a, hsv_b):
+    hue_delta = abs(float(hsv_a[0]) - float(hsv_b[0]))
+    hue_delta = min(hue_delta, 180.0 - hue_delta)
+    sat_delta = abs(float(hsv_a[1]) - float(hsv_b[1]))
+    val_delta = abs(float(hsv_a[2]) - float(hsv_b[2]))
+    weighted_h = hue_delta * 2.2
+    weighted_s = sat_delta * 1.0
+    weighted_v = val_delta * 0.45
+    return (weighted_h * weighted_h + weighted_s * weighted_s + weighted_v * weighted_v) ** 0.5
+
+
 def main():
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     yolo_config_dir = os.environ.get("YOLO_CONFIG_DIR", "").strip()
@@ -117,6 +155,21 @@ def main():
     perf_total_total_ms = 0.0
     perf_log_interval = 20
 
+    recent_track_window_frames = 45
+    profile_ttl_frames = 1200
+    max_track_profiles = 256
+    recent_color_match_threshold = 85.0
+    reid_color_match_threshold = 62.0
+    center_match_threshold = 0.28
+    center_distance_weight = 55.0
+    reid_age_penalty = 0.02
+    color_ema = 0.2
+    center_ema = 0.3
+
+    track_state = {}
+    next_track_id = 1
+    frame_seq = 0
+
     for raw_line in sys.stdin.buffer:
         if not raw_line:
             break
@@ -142,6 +195,7 @@ def main():
             if frame is None:
                 raise RuntimeError("Failed to decode JPEG frame.")
             decode_done = time.perf_counter()
+            frame_seq += 1
 
             height, width = frame.shape[:2]
             with contextlib.redirect_stdout(sys.stderr):
@@ -156,6 +210,7 @@ def main():
 
             detections = []
             boxes = result.boxes
+            used_track_ids = set()
             if boxes is not None:
                 for box in boxes:
                     cls_id = int(box.cls.item()) if box.cls is not None else -1
@@ -171,9 +226,76 @@ def main():
                     if x2 <= x1 or y2 <= y1:
                         continue
 
+                    color_signature = extract_color_signature(frame, x1, y1, x2, y2, cv2, np)
+                    center = np.array(
+                        [((x1 + x2) * 0.5) / width, ((y1 + y2) * 0.5) / height],
+                        dtype=np.float32,
+                    )
+
+                    selected_track_id = None
+                    best_score = float("inf")
+                    if color_signature is not None:
+                        # Pass 1: short-gap tracking with color + spatial continuity.
+                        for track_id, track in track_state.items():
+                            if track_id in used_track_ids:
+                                continue
+                            age = frame_seq - track["last_seen"]
+                            if age > recent_track_window_frames:
+                                continue
+
+                            color_distance = hsv_distance(color_signature, track["hsv"])
+                            if color_distance > recent_color_match_threshold:
+                                continue
+
+                            center_distance = float(np.linalg.norm(center - track["center"]))
+                            if center_distance > center_match_threshold:
+                                continue
+
+                            score = color_distance + (center_distance * center_distance_weight)
+                            if score < best_score:
+                                best_score = score
+                                selected_track_id = track_id
+
+                        # Pass 2: long-gap re-identification based on clothing color.
+                        if selected_track_id is None:
+                            for track_id, track in track_state.items():
+                                if track_id in used_track_ids:
+                                    continue
+                                age = frame_seq - track["last_seen"]
+                                if age > profile_ttl_frames:
+                                    continue
+
+                                color_distance = hsv_distance(color_signature, track["hsv"])
+                                if color_distance > reid_color_match_threshold:
+                                    continue
+
+                                score = color_distance + (age * reid_age_penalty)
+                                if score < best_score:
+                                    best_score = score
+                                    selected_track_id = track_id
+
+                    if selected_track_id is None:
+                        selected_track_id = next_track_id
+                        next_track_id += 1
+                        track_state[selected_track_id] = {
+                            "hsv": color_signature if color_signature is not None else np.zeros(3, dtype=np.float32),
+                            "center": center,
+                            "last_seen": frame_seq,
+                            "seen_count": 1,
+                        }
+                    else:
+                        track = track_state[selected_track_id]
+                        if color_signature is not None:
+                            track["hsv"] = ((1.0 - color_ema) * track["hsv"]) + (color_ema * color_signature)
+                        track["center"] = ((1.0 - center_ema) * track["center"]) + (center_ema * center)
+                        track["last_seen"] = frame_seq
+                        track["seen_count"] = int(track.get("seen_count", 1)) + 1
+
+                    used_track_ids.add(selected_track_id)
                     detections.append(
                         {
                             "label": label,
+                            "track_id": selected_track_id,
                             "confidence": confidence,
                             "x": x1 / width,
                             "y": y1 / height,
@@ -182,6 +304,19 @@ def main():
                         }
                     )
             post_done = time.perf_counter()
+
+            stale_track_ids = [
+                track_id
+                for track_id, track in track_state.items()
+                if frame_seq - track["last_seen"] > profile_ttl_frames
+            ]
+            for stale_track_id in stale_track_ids:
+                del track_state[stale_track_id]
+            if len(track_state) > max_track_profiles:
+                overflow = len(track_state) - max_track_profiles
+                oldest = sorted(track_state.items(), key=lambda item: item[1]["last_seen"])[:overflow]
+                for track_id, _ in oldest:
+                    del track_state[track_id]
 
             decode_ms = (decode_done - frame_start) * 1000.0
             infer_ms = (infer_done - decode_done) * 1000.0
