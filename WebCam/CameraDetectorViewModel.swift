@@ -111,6 +111,11 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             environment["YOLO_TARGET_KEYWORDS"] = "person,human,body,face,head,hand,arm,leg,foot"
             environment["YOLO_CONFIG_DIR"] = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ultralytics-config", isDirectory: true).path
+            let sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            let projectDir = sourceDir.deletingLastPathComponent()
+            let reidMemoryBaseDir = FileManager.default.fileExists(atPath: projectDir.path) ? projectDir : sourceDir
+            environment["REID_MEMORY_PATH"] = reidMemoryBaseDir
+                .appendingPathComponent("reid_identity_memory.json", isDirectory: false).path
             environment["PYTHONUNBUFFERED"] = "1"
             environment["YOLO_DEVICE"] = preferredDevice
             environment["METAL_DEVICE_WRAPPER_TYPE"] = "0"

@@ -63,42 +63,253 @@ def emit_json(payload):
     sys.stdout.flush()
 
 
-def extract_color_signature(frame, x1, y1, x2, y2, cv2_module, np_module):
-    ix1 = max(0, int(x1))
-    iy1 = max(0, int(y1))
-    ix2 = min(frame.shape[1], int(x2))
-    iy2 = min(frame.shape[0], int(y2))
-    if ix2 <= ix1 or iy2 <= iy1:
+def load_reid_memory(memory_path, np_module):
+    if not memory_path.exists():
+        return 1, {}
+
+    try:
+        raw = json.loads(memory_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pylint: disable=broad-except
+        log_stderr(f"[ReIDMemory] Failed to read {memory_path}: {type(exc).__name__}: {exc}")
+        return 1, {}
+
+    next_id = int(raw.get("next_id", 1)) if isinstance(raw, dict) else 1
+    if next_id < 1:
+        next_id = 1
+    profiles = {}
+    items = raw.get("profiles", []) if isinstance(raw, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        stable_id = int(item.get("id", -1))
+        if stable_id < 1:
+            continue
+        embedding_raw = item.get("embedding")
+        if not isinstance(embedding_raw, list) or not embedding_raw:
+            continue
+        emb = np_module.asarray(embedding_raw, dtype=np_module.float32)
+        norm = float(np_module.linalg.norm(emb))
+        if norm <= 1e-12:
+            continue
+        emb = emb / norm
+        profiles[stable_id] = {
+            "embedding": emb,
+            "seen_count": int(item.get("seen_count", 0)),
+            "last_seen_frame": int(item.get("last_seen_frame", -1)),
+        }
+        if stable_id >= next_id:
+            next_id = stable_id + 1
+    return next_id, profiles
+
+
+def save_reid_memory(memory_path, next_id, profiles):
+    payload = {
+        "next_id": int(next_id),
+        "profiles": [],
+    }
+    for stable_id, profile in sorted(profiles.items()):
+        embedding = profile.get("embedding")
+        if embedding is None:
+            continue
+        payload["profiles"].append(
+            {
+                "id": int(stable_id),
+                "embedding": embedding.tolist(),
+                "seen_count": int(profile.get("seen_count", 0)),
+                "last_seen_frame": int(profile.get("last_seen_frame", -1)),
+            }
+        )
+
+    try:
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = memory_path.with_suffix(memory_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.replace(memory_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        log_stderr(f"[ReIDMemory] Failed to write {memory_path}: {type(exc).__name__}: {exc}")
+
+
+def clamp_box_xyxy(x1, y1, x2, y2, width, height):
+    clamped_x1 = max(0.0, min(float(x1), float(width)))
+    clamped_y1 = max(0.0, min(float(y1), float(height)))
+    clamped_x2 = max(0.0, min(float(x2), float(width)))
+    clamped_y2 = max(0.0, min(float(y2), float(height)))
+    if clamped_x2 <= clamped_x1 or clamped_y2 <= clamped_y1:
         return None
-
-    roi = frame[iy1:iy2, ix1:ix2]
-    if roi.size == 0:
-        return None
-
-    roi_h, roi_w = roi.shape[:2]
-    margin_x = int(roi_w * 0.15)
-    margin_y = int(roi_h * 0.15)
-    if roi_w - (2 * margin_x) > 3 and roi_h - (2 * margin_y) > 3:
-        roi = roi[margin_y:roi_h - margin_y, margin_x:roi_w - margin_x]
-
-    sampled = roi[::2, ::2]
-    if sampled.size == 0:
-        sampled = roi
-
-    hsv = cv2_module.cvtColor(sampled, cv2_module.COLOR_BGR2HSV)
-    flat = hsv.reshape(-1, 3)
-    return np_module.median(flat, axis=0).astype(np_module.float32)
+    return clamped_x1, clamped_y1, clamped_x2, clamped_y2
 
 
-def hsv_distance(hsv_a, hsv_b):
-    hue_delta = abs(float(hsv_a[0]) - float(hsv_b[0]))
-    hue_delta = min(hue_delta, 180.0 - hue_delta)
-    sat_delta = abs(float(hsv_a[1]) - float(hsv_b[1]))
-    val_delta = abs(float(hsv_a[2]) - float(hsv_b[2]))
-    weighted_h = hue_delta * 2.2
-    weighted_s = sat_delta * 1.0
-    weighted_v = val_delta * 0.45
-    return (weighted_h * weighted_h + weighted_s * weighted_s + weighted_v * weighted_v) ** 0.5
+def build_yolo_dets_array(boxes, width, height, np_module):
+    yolo_dets = []
+    if boxes is not None:
+        for box in boxes:
+            cls_id = int(box.cls.item()) if box.cls is not None else -1
+            confidence = float(box.conf.item()) if box.conf is not None else 0.0
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            clamped = clamp_box_xyxy(x1, y1, x2, y2, width, height)
+            if clamped is None:
+                continue
+            cx1, cy1, cx2, cy2 = clamped
+            yolo_dets.append([cx1, cy1, cx2, cy2, confidence, float(cls_id)])
+
+    if yolo_dets:
+        return np_module.array(yolo_dets, dtype=np_module.float32)
+    return np_module.empty((0, 6), dtype=np_module.float32)
+
+
+def collect_active_track_features(tracker, np_module):
+    active_track_features = {}
+    for active_track in getattr(tracker, "active_tracks", []):
+        bot_track_id = int(getattr(active_track, "id", -1))
+        if bot_track_id < 0:
+            continue
+        smooth_feat = getattr(active_track, "smooth_feat", None)
+        if smooth_feat is None:
+            continue
+        feat = np_module.asarray(smooth_feat, dtype=np_module.float32)
+        if feat.size == 0:
+            continue
+        feat_norm = float(np_module.linalg.norm(feat))
+        if feat_norm <= 1e-12:
+            continue
+        active_track_features[bot_track_id] = feat / feat_norm
+    return active_track_features
+
+
+class ReIDIdentityStore:
+    def __init__(
+        self,
+        np_module,
+        stable_profiles,
+        next_stable_id,
+        match_threshold,
+        ema,
+        max_profiles,
+        mapping_ttl_frames=600,
+    ):
+        self.np = np_module
+        self.stable_profiles = stable_profiles
+        self.next_stable_id = next_stable_id
+        self.match_threshold = match_threshold
+        self.ema = ema
+        self.max_profiles = max_profiles
+        self.mapping_ttl_frames = mapping_ttl_frames
+        self.track_to_stable = {}
+        self.track_last_seen_frame = {}
+        self.dirty = False
+
+    def mark_track_seen(self, bot_track_id, frame_seq):
+        self.track_last_seen_frame[bot_track_id] = frame_seq
+
+    def _best_profile_match(self, feature, assigned_stable_ids):
+        best_id = None
+        best_score = -1.0
+        for candidate_id, candidate in self.stable_profiles.items():
+            candidate_emb = candidate.get("embedding")
+            if candidate_emb is None:
+                continue
+            if candidate_id in assigned_stable_ids:
+                continue
+            score = float(self.np.dot(feature, candidate_emb))
+            if score > best_score:
+                best_score = score
+                best_id = candidate_id
+        return best_id, best_score
+
+    def resolve_stable_id(self, bot_track_id, feature, frame_seq, assigned_stable_ids):
+        stable_id = self.track_to_stable.get(bot_track_id)
+        if stable_id is None or stable_id not in self.stable_profiles:
+            best_id = None
+            best_score = -1.0
+            if feature is not None:
+                best_id, best_score = self._best_profile_match(feature, assigned_stable_ids)
+            if best_id is not None and best_score >= self.match_threshold:
+                stable_id = best_id
+            else:
+                stable_id = self.next_stable_id
+                self.next_stable_id += 1
+                self.stable_profiles[stable_id] = {
+                    "embedding": feature.copy() if feature is not None else None,
+                    "seen_count": 0,
+                    "last_seen_frame": frame_seq,
+                }
+                self.dirty = True
+        self.track_to_stable[bot_track_id] = stable_id
+        return stable_id
+
+    def update_profile(self, stable_id, feature, frame_seq):
+        profile = self.stable_profiles.setdefault(
+            stable_id,
+            {"embedding": None, "seen_count": 0, "last_seen_frame": frame_seq},
+        )
+        profile["seen_count"] = int(profile.get("seen_count", 0)) + 1
+        profile["last_seen_frame"] = frame_seq
+        if feature is None:
+            return
+        old_emb = profile.get("embedding")
+        if old_emb is None:
+            profile["embedding"] = feature.copy()
+            self.dirty = True
+            return
+
+        updated_emb = ((1.0 - self.ema) * old_emb) + (self.ema * feature)
+        updated_norm = float(self.np.linalg.norm(updated_emb))
+        if updated_norm > 1e-12:
+            profile["embedding"] = updated_emb / updated_norm
+            self.dirty = True
+
+    def cleanup_stale_track_mappings(self, frame_seq):
+        stale_bot_track_ids = [
+            bot_track_id
+            for bot_track_id, last_seen in self.track_last_seen_frame.items()
+            if (frame_seq - last_seen) > self.mapping_ttl_frames
+        ]
+        for bot_track_id in stale_bot_track_ids:
+            self.track_last_seen_frame.pop(bot_track_id, None)
+            self.track_to_stable.pop(bot_track_id, None)
+
+    def prune_profiles(self, assigned_stable_ids):
+        if len(self.stable_profiles) <= self.max_profiles:
+            return
+        overflow = len(self.stable_profiles) - self.max_profiles
+        candidates = sorted(
+            self.stable_profiles.items(),
+            key=lambda item: int(item[1].get("last_seen_frame", -1)),
+        )
+        for stable_id, _ in candidates:
+            if overflow <= 0:
+                break
+            if stable_id in assigned_stable_ids:
+                continue
+            self.stable_profiles.pop(stable_id, None)
+            overflow -= 1
+            self.dirty = True
+
+    def maybe_save(self, memory_path, frame_seq, save_interval):
+        if self.dirty and (frame_seq % save_interval == 0):
+            save_reid_memory(memory_path, self.next_stable_id, self.stable_profiles)
+            self.dirty = False
+
+    def flush(self, memory_path):
+        if self.dirty:
+            save_reid_memory(memory_path, self.next_stable_id, self.stable_profiles)
+            self.dirty = False
+
+
+def log_perf_window(
+    perf_window_count,
+    perf_decode_total_ms,
+    perf_infer_total_ms,
+    perf_post_total_ms,
+    perf_total_total_ms,
+):
+    log_stderr(
+        "[PyPerf] avg over "
+        f"{perf_window_count} frames | decode {perf_decode_total_ms / perf_window_count:.1f} ms"
+        f" | infer {perf_infer_total_ms / perf_window_count:.1f} ms"
+        f" | post {perf_post_total_ms / perf_window_count:.1f} ms"
+        f" | total {perf_total_total_ms / perf_window_count:.1f} ms"
+    )
 
 
 def main():
@@ -113,6 +324,11 @@ def main():
     import cv2  # pylint: disable=import-outside-toplevel
     import numpy as np  # pylint: disable=import-outside-toplevel
     import torch  # pylint: disable=import-outside-toplevel
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+    try:
+        from boxmot import BotSORT  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        from boxmot import BotSort as BotSORT  # pylint: disable=import-outside-toplevel
 
     model_path = os.environ.get("YOLO_MODEL_PATH", "").strip()
     if not model_path:
@@ -122,10 +338,37 @@ def main():
 
     conf_default = float(os.environ.get("YOLO_CONF_THRESHOLD", "0.5"))
     preferred_device = os.environ.get("YOLO_DEVICE", "mps").strip().lower()
+    reid_model_path = os.environ.get("REID_MODEL_PATH", "osnet_x0_25_msmt17.pt").strip()
+    reid_memory_path_env = os.environ.get("REID_MEMORY_PATH", "").strip()
+    reid_memory_match_threshold = float(os.environ.get("REID_MEMORY_MATCH_THRESHOLD", "0.6"))
+    reid_memory_ema = float(os.environ.get("REID_MEMORY_EMA", "0.2"))
+    reid_memory_max_profiles = int(os.environ.get("REID_MEMORY_MAX_PROFILES", "256"))
+    reid_memory_save_interval = max(1, int(os.environ.get("REID_MEMORY_SAVE_INTERVAL_FRAMES", "30")))
     keyword_text = os.environ.get(
         "YOLO_TARGET_KEYWORDS",
         "person,human,body,face,head,hand,arm,leg,foot",
     )
+
+    script_dir = Path(__file__).resolve().parent
+    reid_weights = Path(reid_model_path).expanduser() if reid_model_path else Path("osnet_x0_25_msmt17.pt")
+    if not reid_weights.is_absolute():
+        reid_weights = script_dir / reid_weights
+    if not reid_weights.exists():
+        fallback_reid = script_dir / "osnet_x0_25_msmt17.pt"
+        if fallback_reid.exists():
+            reid_weights = fallback_reid
+        elif yolo_config_dir:
+            reid_weights = Path(yolo_config_dir) / "osnet_x0_25_msmt17.pt"
+    reid_weights = reid_weights.resolve()
+    if reid_memory_path_env:
+        reid_memory_path = Path(reid_memory_path_env).expanduser()
+        if not reid_memory_path.is_absolute():
+            reid_memory_path = script_dir / reid_memory_path
+    elif yolo_config_dir:
+        reid_memory_path = Path(yolo_config_dir) / "reid_identity_memory.json"
+    else:
+        reid_memory_path = script_dir / "reid_identity_memory.json"
+    reid_memory_path = reid_memory_path.resolve()
 
     log_stderr(f"Loading model: {model_path}")
     with contextlib.redirect_stdout(sys.stderr):
@@ -138,6 +381,24 @@ def main():
     target_ids = select_target_ids(names_map, keyword_text)
     log_stderr(f"Device: {device}")
     log_stderr(f"Target class IDs: {target_ids if target_ids else 'all'}")
+    tracker = BotSORT(
+        reid_weights=reid_weights,
+        device=device,
+        half=False,
+        per_class=False,
+    )
+    log_stderr(f"[ReID] Loaded: {reid_weights.name} on {device}")
+    next_stable_id, stable_profiles = load_reid_memory(reid_memory_path, np)
+    reid_store = ReIDIdentityStore(
+        np_module=np,
+        stable_profiles=stable_profiles,
+        next_stable_id=next_stable_id,
+        match_threshold=reid_memory_match_threshold,
+        ema=reid_memory_ema,
+        max_profiles=reid_memory_max_profiles,
+    )
+    frame_seq = 0
+    log_stderr(f"[ReIDMemory] Loaded {len(reid_store.stable_profiles)} profiles from {reid_memory_path}")
     emit_json(
         {
             "ready": True,
@@ -145,6 +406,7 @@ def main():
             "mps_available": bool(torch.backends.mps.is_available()),
             "python_executable": sys.executable,
             "torch_version": torch.__version__,
+            "reid_model": reid_weights.name,
         }
     )
 
@@ -154,21 +416,6 @@ def main():
     perf_post_total_ms = 0.0
     perf_total_total_ms = 0.0
     perf_log_interval = 20
-
-    recent_track_window_frames = 45
-    profile_ttl_frames = 1200
-    max_track_profiles = 256
-    recent_color_match_threshold = 85.0
-    reid_color_match_threshold = 62.0
-    center_match_threshold = 0.28
-    center_distance_weight = 55.0
-    reid_age_penalty = 0.02
-    color_ema = 0.2
-    center_ema = 0.3
-
-    track_state = {}
-    next_track_id = 1
-    frame_seq = 0
 
     for raw_line in sys.stdin.buffer:
         if not raw_line:
@@ -180,6 +427,7 @@ def main():
         frame_id = -1
         try:
             frame_start = time.perf_counter()
+            frame_seq += 1
             request = json.loads(line)
             if not isinstance(request, dict):
                 raise ValueError("Input JSON must be an object.")
@@ -195,7 +443,6 @@ def main():
             if frame is None:
                 raise RuntimeError("Failed to decode JPEG frame.")
             decode_done = time.perf_counter()
-            frame_seq += 1
 
             height, width = frame.shape[:2]
             with contextlib.redirect_stdout(sys.stderr):
@@ -209,114 +456,55 @@ def main():
             infer_done = time.perf_counter()
 
             detections = []
-            boxes = result.boxes
-            used_track_ids = set()
-            if boxes is not None:
-                for box in boxes:
-                    cls_id = int(box.cls.item()) if box.cls is not None else -1
-                    label = names_map.get(cls_id, f"class_{cls_id}")
-                    confidence = float(box.conf.item()) if box.conf is not None else 0.0
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+            dets_array = build_yolo_dets_array(result.boxes, width, height, np)
 
-                    x1 = max(0.0, min(float(x1), float(width)))
-                    x2 = max(0.0, min(float(x2), float(width)))
-                    y1 = max(0.0, min(float(y1), float(height)))
-                    y2 = max(0.0, min(float(y2), float(height)))
+            tracks = tracker.update(dets_array, frame)
+            if tracks is None:
+                tracks = np.empty((0, 7), dtype=np.float32)
 
-                    if x2 <= x1 or y2 <= y1:
-                        continue
+            active_track_features = collect_active_track_features(tracker, np)
 
-                    color_signature = extract_color_signature(frame, x1, y1, x2, y2, cv2, np)
-                    center = np.array(
-                        [((x1 + x2) * 0.5) / width, ((y1 + y2) * 0.5) / height],
-                        dtype=np.float32,
-                    )
+            assigned_stable_ids = set()
+            for t in tracks:
+                if len(t) < 7:
+                    continue
+                clamped_track = clamp_box_xyxy(t[0], t[1], t[2], t[3], width, height)
+                if clamped_track is None:
+                    continue
+                x1, y1, x2, y2 = clamped_track
 
-                    selected_track_id = None
-                    best_score = float("inf")
-                    if color_signature is not None:
-                        # Pass 1: short-gap tracking with color + spatial continuity.
-                        for track_id, track in track_state.items():
-                            if track_id in used_track_ids:
-                                continue
-                            age = frame_seq - track["last_seen"]
-                            if age > recent_track_window_frames:
-                                continue
+                bot_track_id = int(t[4])
+                reid_store.mark_track_seen(bot_track_id, frame_seq)
+                feature = active_track_features.get(bot_track_id)
+                stable_id = reid_store.resolve_stable_id(
+                    bot_track_id,
+                    feature,
+                    frame_seq,
+                    assigned_stable_ids,
+                )
+                assigned_stable_ids.add(stable_id)
+                reid_store.update_profile(stable_id, feature, frame_seq)
 
-                            color_distance = hsv_distance(color_signature, track["hsv"])
-                            if color_distance > recent_color_match_threshold:
-                                continue
+                track_id = int(stable_id)
+                confidence = float(t[5])
+                cls_id = int(t[6])
+                label = names_map.get(cls_id, f"class_{cls_id}")
+                detections.append(
+                    {
+                        "label": label,
+                        "track_id": track_id,
+                        "confidence": confidence,
+                        "x": x1 / width,
+                        "y": y1 / height,
+                        "w": (x2 - x1) / width,
+                        "h": (y2 - y1) / height,
+                    }
+                )
 
-                            center_distance = float(np.linalg.norm(center - track["center"]))
-                            if center_distance > center_match_threshold:
-                                continue
-
-                            score = color_distance + (center_distance * center_distance_weight)
-                            if score < best_score:
-                                best_score = score
-                                selected_track_id = track_id
-
-                        # Pass 2: long-gap re-identification based on clothing color.
-                        if selected_track_id is None:
-                            for track_id, track in track_state.items():
-                                if track_id in used_track_ids:
-                                    continue
-                                age = frame_seq - track["last_seen"]
-                                if age > profile_ttl_frames:
-                                    continue
-
-                                color_distance = hsv_distance(color_signature, track["hsv"])
-                                if color_distance > reid_color_match_threshold:
-                                    continue
-
-                                score = color_distance + (age * reid_age_penalty)
-                                if score < best_score:
-                                    best_score = score
-                                    selected_track_id = track_id
-
-                    if selected_track_id is None:
-                        selected_track_id = next_track_id
-                        next_track_id += 1
-                        track_state[selected_track_id] = {
-                            "hsv": color_signature if color_signature is not None else np.zeros(3, dtype=np.float32),
-                            "center": center,
-                            "last_seen": frame_seq,
-                            "seen_count": 1,
-                        }
-                    else:
-                        track = track_state[selected_track_id]
-                        if color_signature is not None:
-                            track["hsv"] = ((1.0 - color_ema) * track["hsv"]) + (color_ema * color_signature)
-                        track["center"] = ((1.0 - center_ema) * track["center"]) + (center_ema * center)
-                        track["last_seen"] = frame_seq
-                        track["seen_count"] = int(track.get("seen_count", 1)) + 1
-
-                    used_track_ids.add(selected_track_id)
-                    detections.append(
-                        {
-                            "label": label,
-                            "track_id": selected_track_id,
-                            "confidence": confidence,
-                            "x": x1 / width,
-                            "y": y1 / height,
-                            "w": (x2 - x1) / width,
-                            "h": (y2 - y1) / height,
-                        }
-                    )
+            reid_store.cleanup_stale_track_mappings(frame_seq)
+            reid_store.prune_profiles(assigned_stable_ids)
+            reid_store.maybe_save(reid_memory_path, frame_seq, reid_memory_save_interval)
             post_done = time.perf_counter()
-
-            stale_track_ids = [
-                track_id
-                for track_id, track in track_state.items()
-                if frame_seq - track["last_seen"] > profile_ttl_frames
-            ]
-            for stale_track_id in stale_track_ids:
-                del track_state[stale_track_id]
-            if len(track_state) > max_track_profiles:
-                overflow = len(track_state) - max_track_profiles
-                oldest = sorted(track_state.items(), key=lambda item: item[1]["last_seen"])[:overflow]
-                for track_id, _ in oldest:
-                    del track_state[track_id]
 
             decode_ms = (decode_done - frame_start) * 1000.0
             infer_ms = (infer_done - decode_done) * 1000.0
@@ -330,12 +518,12 @@ def main():
             perf_total_total_ms += total_ms
 
             if perf_window_count >= perf_log_interval:
-                log_stderr(
-                    "[PyPerf] avg over "
-                    f"{perf_window_count} frames | decode {perf_decode_total_ms / perf_window_count:.1f} ms"
-                    f" | infer {perf_infer_total_ms / perf_window_count:.1f} ms"
-                    f" | post {perf_post_total_ms / perf_window_count:.1f} ms"
-                    f" | total {perf_total_total_ms / perf_window_count:.1f} ms"
+                log_perf_window(
+                    perf_window_count,
+                    perf_decode_total_ms,
+                    perf_infer_total_ms,
+                    perf_post_total_ms,
+                    perf_total_total_ms,
                 )
                 perf_window_count = 0
                 perf_decode_total_ms = 0.0
@@ -349,6 +537,8 @@ def main():
             message = f"{type(exc).__name__}: {exc}"
             log_stderr(message)
             emit_json({"frame_id": frame_id, "detections": [], "error": message})
+
+    reid_store.flush(reid_memory_path)
 
 
 if __name__ == "__main__":
