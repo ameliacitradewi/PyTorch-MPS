@@ -31,6 +31,7 @@ private nonisolated struct PythonFrameRequest: Encodable {
 
 private nonisolated struct PythonDetectionPayload: Decodable {
     let label: String
+    let track_id: Int?
     let confidence: Double
     let x: Double
     let y: Double
@@ -110,6 +111,15 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             environment["YOLO_TARGET_KEYWORDS"] = "person,human,body,face,head,hand,arm,leg,foot"
             environment["YOLO_CONFIG_DIR"] = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ultralytics-config", isDirectory: true).path
+            let sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            let projectDir = sourceDir.deletingLastPathComponent()
+            let memoryBaseDir = FileManager.default.fileExists(atPath: projectDir.path) ? projectDir : sourceDir
+            environment["REID_MEMORY_PATH"] = memoryBaseDir
+                .appendingPathComponent("reid_identity_memory.json", isDirectory: false).path
+            let reidModelURL = sourceDir.appendingPathComponent("osnet_x0_25_msmt17.pt")
+            if FileManager.default.fileExists(atPath: reidModelURL.path) {
+                environment["REID_MODEL_PATH"] = reidModelURL.path
+            }
             environment["PYTHONUNBUFFERED"] = "1"
             environment["YOLO_DEVICE"] = preferredDevice
             environment["METAL_DEVICE_WRAPPER_TYPE"] = "0"
@@ -355,9 +365,16 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             let clampedW = min(max(payload.w, 0), 1)
             let clampedH = min(max(payload.h, 0), 1)
             guard clampedW > 0.001, clampedH > 0.001 else { return nil }
+            let baseLabel = payload.label.capitalized
+            let displayLabel: String
+            if let trackID = payload.track_id {
+                displayLabel = "ID \(trackID) - \(baseLabel)"
+            } else {
+                displayLabel = baseLabel
+            }
 
             return DetectionDisplay(
-                label: payload.label.capitalized,
+                label: displayLabel,
                 confidence: payload.confidence,
                 boundingBox: CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
             )
@@ -437,7 +454,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             code: 100,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "No compatible Python found. Set WEBCAM_PYTHON_PATH to a Python with torch, ultralytics, opencv-python, and numpy."
+                    "No compatible Python found. Set WEBCAM_PYTHON_PATH to a Python with torch, ultralytics, opencv-python, numpy, and boxmot."
             ]
         )
     }
@@ -445,7 +462,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
     private func pythonHasDependencies(path: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["-c", "import torch, ultralytics, cv2, numpy, PIL"]
+        process.arguments = ["-c", "import torch, ultralytics, cv2, numpy, PIL, boxmot"]
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
