@@ -86,7 +86,8 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
         scriptURL: URL,
         modelURL: URL,
         confidenceThreshold: Double,
-        preferredDevice: String
+        preferredDevice: String,
+        reidMemoryURL: URL
     ) throws {
         var thrownError: Error?
 
@@ -111,11 +112,8 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             environment["YOLO_TARGET_KEYWORDS"] = "person,human,body,face,head,hand,arm,leg,foot"
             environment["YOLO_CONFIG_DIR"] = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ultralytics-config", isDirectory: true).path
+            environment["REID_MEMORY_PATH"] = reidMemoryURL.path
             let sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            let projectDir = sourceDir.deletingLastPathComponent()
-            let memoryBaseDir = FileManager.default.fileExists(atPath: projectDir.path) ? projectDir : sourceDir
-            environment["REID_MEMORY_PATH"] = memoryBaseDir
-                .appendingPathComponent("reid_identity_memory.json", isDirectory: false).path
             let reidModelURL = sourceDir.appendingPathComponent("osnet_x0_25_msmt17.pt")
             if FileManager.default.fileExists(atPath: reidModelURL.path) {
                 environment["REID_MODEL_PATH"] = reidModelURL.path
@@ -162,6 +160,7 @@ private nonisolated final class PythonMPSDetectorBridge: @unchecked Sendable {
             self.bridgePerfDetectionTotal = 0
             self.onStatus?("Using Python: \(pythonExecutable)")
             self.onStatus?("Requested device: \(preferredDevice)")
+            self.onStatus?("ReID memory file: \(reidMemoryURL.path)")
 
             stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 guard let self else { return }
@@ -513,6 +512,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
     nonisolated(unsafe) private var pythonDevicePreference = "mps"
     nonisolated(unsafe) private var didFallbackToCPU = false
     nonisolated(unsafe) private var isRestartingPythonBridge = false
+    nonisolated(unsafe) private var sessionReIDMemoryURL: URL?
 
     nonisolated(unsafe) private var model: MLModel?
     nonisolated(unsafe) private var isSessionConfigured = false
@@ -543,6 +543,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
         pythonDevicePreference = initialPythonDevicePreference()
         didFallbackToCPU = false
         isRestartingPythonBridge = false
+        sessionReIDMemoryURL = resetReIDMemoryFileForNewSession()
         framesUntilNextInference = 0
         inferenceSendAttemptCount = 0
         inferenceSendSkippedCount = 0
@@ -575,6 +576,7 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             self.pythonBridge?.stop()
             self.pythonBridge = nil
             self.isRestartingPythonBridge = false
+            self.sessionReIDMemoryURL = nil
             self.pendingPauseFrameCapture = false
             DispatchQueue.main.async { [weak self] in
                 self?.pausedPreviewImage = nil
@@ -666,6 +668,16 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
 
     nonisolated private func startPythonBridgeIfNeeded() throws {
         guard pythonBridge == nil else { return }
+        if sessionReIDMemoryURL == nil {
+            sessionReIDMemoryURL = defaultReIDMemoryURL()
+        }
+        guard let reidMemoryURL = sessionReIDMemoryURL else {
+            throw NSError(
+                domain: "CameraDetectorViewModel",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot initialize ReID memory path for this app session."]
+            )
+        }
         guard let scriptURL = resolvePythonScriptURL() else {
             throw NSError(
                 domain: "CameraDetectorViewModel",
@@ -701,9 +713,25 @@ final class CameraDetectorViewModel: NSObject, ObservableObject {
             scriptURL: scriptURL,
             modelURL: modelURL,
             confidenceThreshold: confidenceThreshold,
-            preferredDevice: pythonDevicePreference
+            preferredDevice: pythonDevicePreference,
+            reidMemoryURL: reidMemoryURL
         )
         pythonBridge = bridge
+    }
+
+    nonisolated private func defaultReIDMemoryURL() -> URL {
+        let sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let projectDir = sourceDir.deletingLastPathComponent()
+        let memoryBaseDir = FileManager.default.fileExists(atPath: projectDir.path) ? projectDir : sourceDir
+        return memoryBaseDir.appendingPathComponent("reid_identity_memory.json", isDirectory: false)
+    }
+
+    nonisolated private func resetReIDMemoryFileForNewSession() -> URL {
+        let memoryURL = defaultReIDMemoryURL()
+        if FileManager.default.fileExists(atPath: memoryURL.path) {
+            try? FileManager.default.removeItem(at: memoryURL)
+        }
+        return memoryURL
     }
 
     nonisolated private func handlePythonBridgeError(_ message: String) {
